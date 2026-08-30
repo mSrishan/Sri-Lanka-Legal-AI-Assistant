@@ -1,0 +1,97 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import os
+import glob
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+
+# 1. Environment Variables (.env) Load කිරීම
+load_dotenv()
+if not os.getenv("GOOGLE_API_KEY"):
+    raise ValueError("GOOGLE_API_KEY is missing in .env file!")
+
+app = FastAPI(title="Sri Lankan Legal AI API", version="1.0.0")
+
+# 2. CORS Settings (Next.js Frontend එකට සම්බන්ධ වීමට)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], # Production වලදී මෙය වෙනස් කළ හැක
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+print("AI System එක Load වෙමින් පවතී... ⏳")
+
+# 3. Dataset ෆෝල්ඩරයෙන් PDF කියවීම
+documents = []
+dataset_path = os.path.join(os.path.dirname(__file__), "dataset", "*.pdf")
+pdf_files = glob.glob(dataset_path)
+
+if not pdf_files:
+    print("⚠️ අනතුරු ඇඟවීමයි: 'dataset' ෆෝල්ඩරයේ PDF ගොනු කිසිවක් නොමැත!")
+else:
+    for file in pdf_files:
+        try:
+            loader = PyMuPDFLoader(file)
+            documents.extend(loader.load())
+        except Exception as e:
+            print(f"Error loading {file}: {e}")
+
+# 4. Vector Database එක සැකසීම
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = text_splitter.split_documents(documents)
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+vector_db = FAISS.from_documents(chunks, embeddings)
+retriever = vector_db.as_retriever(search_kwargs={"k": 4})
+
+# 5. Gemini 3.6 Flash ආකෘතිය සැකසීම
+llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+
+prompt_template = """
+You are a highly accurate Sri Lankan Legal AI Assistant. 
+Use ONLY the following pieces of retrieved context to answer the question at the end. 
+Whenever you state a fact, you MUST include the [Source Document: ...] name to show where you found it.
+If the answer is not contained in the context, strictly say "I cannot find the exact legal provision for this in the provided documents."
+
+Context: 
+{context}
+
+Question: {question}
+Answer:"""
+
+prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+
+def format_docs(docs):
+    return "\n\n".join(f"[Source Document: {os.path.basename(doc.metadata.get('source', 'Unknown'))}]\n{doc.page_content}" for doc in docs)
+
+qa_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+print("AI System සූදානම්! 🚀")
+
+# 6. API Schemas සහ Endpoints
+class QuestionRequest(BaseModel):
+    question: str
+
+@app.post("/api/ask", summary="Ask a legal question")
+async def ask_question(req: QuestionRequest):
+    try:
+        response = qa_chain.invoke(req.question)
+        return {"answer": response.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
