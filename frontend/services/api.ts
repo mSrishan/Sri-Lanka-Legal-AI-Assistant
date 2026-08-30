@@ -1,17 +1,26 @@
 // frontend/src/services/api.ts
 
-export const askLegalQuestion = async (question: string) => {
+export type Message = {
+  role: "user" | "ai";
+  content: string;
+};
+
+export const askLegalQuestion = async (
+  question: string,
+  history: Message[],
+) => {
   try {
     const response = await fetch("http://127.0.0.1:8000/api/ask", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ question }),
+      // Send both the question and the chat history
+      body: JSON.stringify({ question, history }),
     });
 
     if (!response.ok) {
-      throw new Error("සර්වර් එක හා සම්බන්ධ වීමේ දෝෂයක් ඇත.");
+      throw new Error("Server connection error.");
     }
 
     const data = await response.json();
