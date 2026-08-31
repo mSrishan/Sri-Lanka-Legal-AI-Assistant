@@ -4,13 +4,22 @@
 import { useState, useRef, useEffect } from "react";
 import { askLegalQuestionStream, Message } from "../services/api";
 import ReactMarkdown from "react-markdown";
+import { supabase } from "../lib/supabase"; // <-- Supabase Import
 
-// 1. New Type for Chat Sessions
+// Types matching Database Schema
 type ChatSession = {
   id: string;
   title: string;
-  messages: Message[];
-  updatedAt: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type DbMessage = {
+  id?: string;
+  session_id: string;
+  role: "user" | "ai";
+  content: string;
+  created_at?: string;
 };
 
 // Small reusable logo mark
@@ -36,6 +45,8 @@ export default function Home() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
 
+  // Only hold messages for the active session
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -44,46 +55,68 @@ export default function Home() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  // Load Chats from LocalStorage on mount
+  // 1. Fetch Sessions from Supabase on Load
   useEffect(() => {
-    const savedSessions = localStorage.getItem("legal-ai-chats");
-    if (savedSessions) {
-      const parsed = JSON.parse(savedSessions);
-      setSessions(parsed);
-      if (parsed.length > 0) setActiveId(parsed[0].id);
+    fetchSessions();
+  }, []);
+
+  const fetchSessions = async () => {
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .select("*")
+      .order("updated_at", { ascending: false });
+
+    if (data && data.length > 0) {
+      setSessions(data);
+      setActiveId(data[0].id);
     } else {
       createNewChat();
     }
-  }, []);
-
-  // Save Chats to LocalStorage whenever they change
-  useEffect(() => {
-    if (sessions.length > 0) {
-      localStorage.setItem("legal-ai-chats", JSON.stringify(sessions));
-    }
-  }, [sessions]);
-
-  // Scroll to bottom
-  useEffect(() => {
-    scrollToBottom();
-  }, [sessions, activeId]);
-
-  const activeSession = sessions.find((s) => s.id === activeId);
-  const messages = activeSession?.messages || [];
-
-  // Function to create a new chat session
-  const createNewChat = () => {
-    const newChat: ChatSession = {
-      id: Date.now().toString(),
-      title: "New Legal Query",
-      messages: [],
-      updatedAt: Date.now(),
-    };
-    setSessions((prev) => [newChat, ...prev]);
-    setActiveId(newChat.id);
   };
 
-  // Modified handleSend to update the specific active session
+  // 2. Fetch Messages when active session changes
+  useEffect(() => {
+    if (activeId) {
+      fetchMessages(activeId);
+    }
+  }, [activeId]);
+
+  const fetchMessages = async (sessionId: string) => {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: true });
+
+    if (data) {
+      const formattedMessages = data.map((msg: DbMessage) => ({
+        role: msg.role,
+        content: msg.content,
+      }));
+      setMessages(formattedMessages);
+    }
+    scrollToBottom();
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // 3. Create a New Chat in Supabase
+  const createNewChat = async () => {
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .insert([{ title: "New Legal Query" }])
+      .select();
+
+    if (data && data[0]) {
+      setSessions((prev) => [data[0], ...prev]);
+      setActiveId(data[0].id);
+      setMessages([]);
+    }
+  };
+
+  // 4. Handle Send & Save to Supabase
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || !activeId) return;
@@ -91,75 +124,69 @@ export default function Home() {
     const userMsg = input.trim();
     setInput("");
 
-    // Auto-generate a title based on the first question
-    let chatTitle = activeSession?.title;
-    if (messages.length === 0) {
-      chatTitle =
-        userMsg.length > 25 ? userMsg.substring(0, 25) + "..." : userMsg;
-    }
-
+    // A. Update UI immediately
     const currentMessages: Message[] = [
       ...messages,
       { role: "user", content: userMsg },
     ];
-
-    // Update State immediately with placeholder AI message
-    setSessions((prev) =>
-      prev
-        .map((s) =>
-          s.id === activeId
-            ? {
-                ...s,
-                title: chatTitle || s.title,
-                messages: [
-                  ...currentMessages,
-                  { role: "ai", content: "" } as Message,
-                ],
-                updatedAt: Date.now(),
-              }
-            : s,
-        )
-        .sort((a, b) => b.updatedAt - a.updatedAt),
-    );
-
+    setMessages([...currentMessages, { role: "ai", content: "" }]);
     setLoading(true);
 
+    // B. Save User message to DB
+    await supabase
+      .from("messages")
+      .insert([{ session_id: activeId, role: "user", content: userMsg }]);
+
+    // C. Update Session Title if it's the first message
+    if (messages.length === 0) {
+      const chatTitle =
+        userMsg.length > 25 ? userMsg.substring(0, 25) + "..." : userMsg;
+      await supabase
+        .from("chat_sessions")
+        .update({ title: chatTitle, updated_at: new Date().toISOString() })
+        .eq("id", activeId);
+
+      setSessions((prev) =>
+        prev.map((s) => (s.id === activeId ? { ...s, title: chatTitle } : s)),
+      );
+    }
+
+    // D. Call API Stream and Save AI response
     try {
-    await askLegalQuestionStream(userMsg, currentMessages, (chunk) => {
-      setSessions((prev) =>
-        prev.map((s) => {
-          if (s.id === activeId) {
-            // අලුත් Array එකක් නොසාදා පවතින Array එකම Update කිරීමෙන් වේගය වැඩි වේ
-            const updatedMessages = [...s.messages];
-            const lastIndex = updatedMessages.length - 1;
-            updatedMessages[lastIndex].content += chunk;
-            return { ...s, messages: updatedMessages };
-          }
-          return s;
-        }),
-      );
-      // Loading එක false කරන්නේ පළමු chunk එක ආවට පස්සේ පමණයි
-      if (loading) setLoading(false);
-    });
+      let fullAiResponse = "";
+      await askLegalQuestionStream(userMsg, currentMessages, (chunk) => {
+        fullAiResponse += chunk;
+        setMessages((prevMessages) => {
+          const updatedMessages = [...prevMessages];
+          const lastIndex = updatedMessages.length - 1;
+          updatedMessages[lastIndex].content = fullAiResponse;
+          return updatedMessages;
+        });
+        setLoading(false);
+      });
+
+      // After stream finishes, save the final AI answer to DB
+      if (fullAiResponse) {
+        await supabase
+          .from("messages")
+          .insert([
+            { session_id: activeId, role: "ai", content: fullAiResponse },
+          ]);
+      }
     } catch (error) {
-      setSessions((prev) =>
-        prev.map((s) => {
-          if (s.id === activeId) {
-            const updatedMessages = [...s.messages];
-            updatedMessages[updatedMessages.length - 1].content =
-              "Sorry, an error occurred while fetching the answer. Please check if the backend is running.";
-            return { ...s, messages: updatedMessages };
-          }
-          return s;
-        }),
-      );
+      setMessages((prevMessages) => {
+        const updatedMessages = [...prevMessages];
+        updatedMessages[updatedMessages.length - 1].content =
+          "Sorry, an error occurred while fetching the answer. Please check if the backend is running.";
+        return updatedMessages;
+      });
       setLoading(false);
     }
   };
 
   return (
     <main className="min-h-screen bg-[#EFEBE0] flex font-sans overflow-hidden">
-      {/* Sidebar Section (Visible on medium and larger screens) */}
+      {/* Sidebar Section */}
       <div className="w-64 bg-[#182848] text-white flex-col hidden md:flex border-r border-[#101b30]">
         <div className="p-5 border-b border-[#233560]">
           <button
@@ -191,7 +218,7 @@ export default function Home() {
 
       {/* Main Chat Container Area */}
       <div className="flex-1 flex flex-col items-center justify-center relative p-4 md:p-8">
-        {/* Mobile Header (Only visible on small screens) */}
+        {/* Mobile Header */}
         <div className="absolute top-0 left-0 right-0 bg-[#182848] px-6 py-4 flex items-center justify-between md:hidden shadow-md z-10">
           <div className="flex items-center gap-2">
             <LogoMark size={20} />
@@ -207,7 +234,7 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Your Original Chat Box UI */}
+        {/* Chat Box UI */}
         <div className="w-full max-w-4xl bg-white shadow-2xl rounded-2xl overflow-hidden flex flex-col h-[85vh] border border-[#E2DFD3] mt-14 md:mt-0">
           {/* Chat Header */}
           <div className="bg-[#182848] px-6 py-4 flex items-center gap-4">

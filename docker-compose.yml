@@ -1,0 +1,22 @@
+# docker-compose.yml
+
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: legal-ai-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend/dataset:/app/dataset # Syncs your local PDFs with the container
+
+  frontend:
+    build: ./frontend
+    container_name: legal-ai-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
