@@ -5,9 +5,10 @@ export type Message = {
   content: string;
 };
 
-export const askLegalQuestion = async (
+export const askLegalQuestionStream = async (
   question: string,
   history: Message[],
+  onChunk: (chunk: string) => void,
 ) => {
   try {
     const response = await fetch("http://127.0.0.1:8000/api/ask", {
@@ -15,7 +16,6 @@ export const askLegalQuestion = async (
       headers: {
         "Content-Type": "application/json",
       },
-      // Send both the question and the chat history
       body: JSON.stringify({ question, history }),
     });
 
@@ -23,8 +23,21 @@ export const askLegalQuestion = async (
       throw new Error("Server connection error.");
     }
 
-    const data = await response.json();
-    return data.answer;
+    if (!response.body) throw new Error("No response body.");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let done = false;
+
+    // Read the stream chunk by chunk
+    while (!done) {
+      const { value, done: readerDone } = await reader.read();
+      done = readerDone;
+      if (value) {
+        const chunk = decoder.decode(value, { stream: true });
+        onChunk(chunk); // Send the chunk back to the UI
+      }
+    }
   } catch (error) {
     console.error("API Error:", error);
     throw error;

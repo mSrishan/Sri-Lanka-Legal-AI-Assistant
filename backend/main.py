@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List
 import os
 import glob
 from dotenv import load_dotenv
 from operator import itemgetter
+
 
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,6 +17,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+
 
 load_dotenv()
 if not os.getenv("GOOGLE_API_KEY"):
@@ -51,9 +54,9 @@ chunks = text_splitter.split_documents(documents)
 
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vector_db = FAISS.from_documents(chunks, embeddings)
-retriever = vector_db.as_retriever(search_kwargs={"k": 4})
+retriever = vector_db.as_retriever(search_kwargs={"k": 2})
 
-llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
+llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1, max_output_tokens=500)
 
 # 1. Add Chat History to the Prompt
 # backend/main.py හි වෙනස් විය යුතු කොටස
@@ -105,16 +108,23 @@ class QuestionRequest(BaseModel):
     question: str
     history: List[ChatMessage] = []
 
-@app.post("/api/ask", summary="Ask a legal question")
+@app.post("/api/ask", summary="Ask a legal question with streaming")
 async def ask_question(req: QuestionRequest):
     try:
         # Format history into a string
         formatted_history = "\n".join([f"{'User' if msg.role == 'user' else 'AI'}: {msg.content}" for msg in req.history])
         
-        response = qa_chain.invoke({
-            "question": req.question,
-            "chat_history": formatted_history
-        })
-        return {"answer": response.strip()}
+        # Generator function for streaming chunks
+        async def generate():
+            try:
+                async for chunk in qa_chain.astream({
+                    "question": req.question,
+                    "chat_history": formatted_history
+                }):
+                    yield chunk
+            except Exception as e:
+                yield f"\n\nError generating response: {str(e)}"
+
+        return StreamingResponse(generate(), media_type="text/plain")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
