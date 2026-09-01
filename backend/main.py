@@ -54,9 +54,9 @@ chunks = text_splitter.split_documents(documents)
 
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vector_db = FAISS.from_documents(chunks, embeddings)
-retriever = vector_db.as_retriever(search_kwargs={"k": 2})
+retriever = vector_db.as_retriever(search_kwargs={"k": 4})
 
-llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1, max_output_tokens=500)
+llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.1)
 
 # 1. Add Chat History to the Prompt
 # backend/main.py හි වෙනස් විය යුතු කොටස
