@@ -4,14 +4,13 @@
 import { useState, useRef, useEffect } from "react";
 import { askLegalQuestionStream, Message } from "../services/api";
 import ReactMarkdown from "react-markdown";
-import { supabase } from "../lib/supabase"; // <-- Supabase Import
+import { supabase } from "../lib/supabase";
 
-// Types matching Database Schema
 type ChatSession = {
   id: string;
   title: string;
-  created_at: string;
-  updated_at: string;
+  created_at?: string;
+  updated_at?: string;
 };
 
 type DbMessage = {
@@ -22,7 +21,6 @@ type DbMessage = {
   created_at?: string;
 };
 
-// Small reusable logo mark
 const LogoMark = ({ size = 24 }: { size?: number }) => (
   <svg
     width={size}
@@ -44,37 +42,43 @@ const LogoMark = ({ size = 24 }: { size?: number }) => (
 export default function Home() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-
-  // Only hold messages for the active session
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  // 1. Fetch Sessions from Supabase on Load
   useEffect(() => {
     fetchSessions();
   }, []);
 
   const fetchSessions = async () => {
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .select("*")
-      .order("updated_at", { ascending: false });
+    try {
+      const { data, error } = await supabase
+        .from("chat_sessions")
+        .select("*")
+        .order("updated_at", { ascending: false });
 
-    if (data && data.length > 0) {
-      setSessions(data);
-      setActiveId(data[0].id);
-    } else {
-      createNewChat();
+      if (error) {
+        console.error("Error fetching sessions:", error);
+      }
+
+      if (data && data.length > 0) {
+        setSessions(data);
+        setActiveId(data[0].id);
+      } else {
+        await createNewChat();
+      }
+    } catch (err) {
+      console.error("Supabase fetch failed:", err);
+      await createNewChat();
     }
   };
 
-  // 2. Fetch Messages when active session changes
   useEffect(() => {
     if (activeId) {
       fetchMessages(activeId);
@@ -82,18 +86,26 @@ export default function Home() {
   }, [activeId]);
 
   const fetchMessages = async (sessionId: string) => {
-    const { data, error } = await supabase
-      .from("messages")
-      .select("*")
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: true });
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("session_id", sessionId)
+        .order("created_at", { ascending: true });
 
-    if (data) {
-      const formattedMessages = data.map((msg: DbMessage) => ({
-        role: msg.role,
-        content: msg.content,
-      }));
-      setMessages(formattedMessages);
+      if (error) {
+        console.error("Error fetching messages:", error);
+      }
+
+      if (data) {
+        const formattedMessages = data.map((msg: DbMessage) => ({
+          role: msg.role,
+          content: msg.content,
+        }));
+        setMessages(formattedMessages);
+      }
+    } catch (err) {
+      console.error("Failed to load messages:", err);
     }
     scrollToBottom();
   };
@@ -102,29 +114,49 @@ export default function Home() {
     scrollToBottom();
   }, [messages]);
 
-  // 3. Create a New Chat in Supabase
-  const createNewChat = async () => {
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .insert([{ title: "New Legal Query" }])
-      .select();
+  const createNewChat = async (): Promise<string | null> => {
+    try {
+      const { data, error } = await supabase
+        .from("chat_sessions")
+        .insert([{ title: "New Legal Query" }])
+        .select();
 
-    if (data && data[0]) {
-      setSessions((prev) => [data[0], ...prev]);
-      setActiveId(data[0].id);
-      setMessages([]);
+      if (error) {
+        console.error("Error creating session in Supabase:", error);
+        return null;
+      }
+
+      if (data && data[0]) {
+        const newSession = data[0];
+        setSessions((prev) => [newSession, ...prev]);
+        setActiveId(newSession.id);
+        setMessages([]);
+        return newSession.id;
+      }
+    } catch (err) {
+      console.error("Failed to create chat session:", err);
     }
+    return null;
   };
 
-  // 4. Handle Send & Save to Supabase
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !activeId) return;
+    if (!input.trim() || loading) return;
+
+    let currentSessionId = activeId;
+
+    // Ensure session exists in Database first
+    if (!currentSessionId) {
+      currentSessionId = await createNewChat();
+      if (!currentSessionId) {
+        console.error("Could not initialize chat session.");
+        return;
+      }
+    }
 
     const userMsg = input.trim();
     setInput("");
 
-    // A. Update UI immediately
     const currentMessages: Message[] = [
       ...messages,
       { role: "user", content: userMsg },
@@ -132,26 +164,41 @@ export default function Home() {
     setMessages([...currentMessages, { role: "ai", content: "" }]);
     setLoading(true);
 
-    // B. Save User message to DB
-    await supabase
-      .from("messages")
-      .insert([{ session_id: activeId, role: "user", content: userMsg }]);
+    // 1. Save User message to Supabase
+    try {
+      const { error: msgErr } = await supabase
+        .from("messages")
+        .insert([
+          { session_id: currentSessionId, role: "user", content: userMsg },
+        ]);
 
-    // C. Update Session Title if it's the first message
+      if (msgErr) {
+        console.error("Error saving user message:", msgErr);
+      }
+    } catch (err) {
+      console.error("Network error while saving user message:", err);
+    }
+
+    // 2. Update session title if first message
     if (messages.length === 0) {
       const chatTitle =
         userMsg.length > 25 ? userMsg.substring(0, 25) + "..." : userMsg;
-      await supabase
+      supabase
         .from("chat_sessions")
         .update({ title: chatTitle, updated_at: new Date().toISOString() })
-        .eq("id", activeId);
+        .eq("id", currentSessionId)
+        .then(({ error }) => {
+          if (error) console.error("Error updating session title:", error);
+        });
 
       setSessions((prev) =>
-        prev.map((s) => (s.id === activeId ? { ...s, title: chatTitle } : s)),
+        prev.map((s) =>
+          s.id === currentSessionId ? { ...s, title: chatTitle } : s,
+        ),
       );
     }
 
-    // D. Call API Stream and Save AI response
+    // 3. Stream AI response and Save to Supabase
     try {
       let fullAiResponse = "";
       await askLegalQuestionStream(userMsg, currentMessages, (chunk) => {
@@ -165,13 +212,20 @@ export default function Home() {
         setLoading(false);
       });
 
-      // After stream finishes, save the final AI answer to DB
-      if (fullAiResponse) {
-        await supabase
+      if (fullAiResponse && currentSessionId) {
+        const { error: aiMsgErr } = await supabase
           .from("messages")
           .insert([
-            { session_id: activeId, role: "ai", content: fullAiResponse },
+            {
+              session_id: currentSessionId,
+              role: "ai",
+              content: fullAiResponse,
+            },
           ]);
+
+        if (aiMsgErr) {
+          console.error("Error saving AI response:", aiMsgErr);
+        }
       }
     } catch (error) {
       setMessages((prevMessages) => {
@@ -190,8 +244,9 @@ export default function Home() {
       <div className="w-64 bg-[#182848] text-white flex-col hidden md:flex border-r border-[#101b30]">
         <div className="p-5 border-b border-[#233560]">
           <button
-            onClick={createNewChat}
-            className="w-full flex items-center justify-center gap-2 bg-[#A67C3D] hover:bg-[#8e6931] text-white px-4 py-3 rounded-lg font-medium transition duration-200 shadow-md"
+            type="button"
+            onClick={() => createNewChat()}
+            className="w-full flex items-center justify-center gap-2 bg-[#A67C3D] hover:bg-[#8e6931] text-white px-4 py-3 rounded-lg font-medium transition duration-200 shadow-md cursor-pointer"
           >
             + New Chat
           </button>
@@ -203,8 +258,9 @@ export default function Home() {
           {sessions.map((session) => (
             <button
               key={session.id}
+              type="button"
               onClick={() => setActiveId(session.id)}
-              className={`w-full text-left truncate px-4 py-3 rounded-lg transition text-sm ${
+              className={`w-full text-left truncate px-4 py-3 rounded-lg transition text-sm cursor-pointer ${
                 activeId === session.id
                   ? "bg-[#233560] text-white shadow-inner border-l-4 border-[#A67C3D]"
                   : "text-[#B9C2D6] hover:bg-[#233560]/50"
@@ -227,7 +283,8 @@ export default function Home() {
             </h1>
           </div>
           <button
-            onClick={createNewChat}
+            type="button"
+            onClick={() => createNewChat()}
             className="text-[#A67C3D] font-medium"
           >
             + New
@@ -330,7 +387,7 @@ export default function Home() {
               <button
                 type="submit"
                 disabled={loading || !input.trim()}
-                className="bg-[#182848] text-white rounded-full px-6 py-3 font-medium hover:bg-[#233560] disabled:opacity-40 disabled:cursor-not-allowed transition duration-200"
+                className="bg-[#182848] text-white rounded-full px-6 py-3 font-medium hover:bg-[#233560] disabled:opacity-40 disabled:cursor-not-allowed transition duration-200 cursor-pointer"
               >
                 Send
               </button>
